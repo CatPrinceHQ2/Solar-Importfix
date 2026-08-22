@@ -128,7 +128,7 @@
     return new Promise((resolve) => requestAnimationFrame(() => resolve()));
   }
 
-  const IMPORT_CHUNK_SIZE = 1500; // notes processed per animation frame during a large import
+  const IMPORT_CHUNK_SIZE = 50; // notes processed per animation frame during a large import
   const IMPORT_CHUNK_THRESHOLD = 3000; // small snapshots (undo/redo, normal-sized songs) apply in one go, no yielding needed
 
   async function addEventsChunked(events, addOne, progressLabel) {
@@ -439,14 +439,33 @@
     return grid.indexToPitch(clampGridRow(grid, point.y));
   }
 
-  function rowForNote(grid, note) {
-    for (let i = 0; i < grid.notes.rows; i++) {
-      try {
-        if (grid.indexToPitch(i) === note) return i;
-      } catch (_) {}
+  // Pitch -> grid row lookup, cached per grid. rowForNote used to linear-scan
+  // every row for every note; that's cheap at low note counts but adds up when
+  // called once per note during a grid refresh. Cached here and reused by the
+  // long-note editor's rowForPitch below. Self-invalidates if the row count
+  // changes (e.g. after an octave/bars change).
+  const pitchRowCaches = new WeakMap(); // grid -> Map<pitch, row>
+
+  function pitchRowMapFor(grid) {
+    let map = pitchRowCaches.get(grid);
+    if (!map || map.__rows !== grid.notes.rows) {
+      map = new Map();
+      map.__rows = grid.notes.rows;
+      for (let i = 0; i < grid.notes.rows; i++) {
+        try {
+          map.set(grid.indexToPitch(i), i);
+        } catch (_) {}
+      }
+      pitchRowCaches.set(grid, map);
     }
-    return null;
+    return map;
   }
+
+  function rowForNote(grid, note) {
+    const map = pitchRowMapFor(grid);
+    return map.has(note) ? map.get(note) : null;
+  }
+
 
   function noteLabel(note) {
     const names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -470,16 +489,42 @@
     setNoteLabels(!state.noteLabels);
   }
 
+  // Coverage index for eventCovering(): buckets notes by the integer time
+  // column(s) they cover. eventCovering used to do a full linear scan over
+  // every instrument + overlay note on every call, and grid.has() (below) calls
+  // eventCovering on essentially every pointermove while hovering the grid -
+  // on a large song that made mouse movement itself an O(n)-per-frame scan.
+  // The index is rebuilt lazily, only when note data has actually changed
+  // (tracked via noteDataVersion, bumped once per edit in refreshInstrumentGrid),
+  // not on every query.
+  let noteDataVersion = 0;
+  let coverageIndex = null;
+  let coverageIndexVersion = -1;
+
   function eventCovering(time, note, activeOnly = false) {
+    if (coverageIndex === null || coverageIndexVersion !== noteDataVersion) {
+      coverageIndex = new Map();
+      const addToIndex = (event) => {
+        const duration = Math.max(1, Number(event.duration) || 1);
+        for (let x = event.time; x < event.time + duration; x++) {
+          let bucket = coverageIndex.get(x);
+          if (!bucket) coverageIndex.set(x, (bucket = []));
+          bucket.push(event);
+        }
+      };
+      forEachInstrumentEvent(addToIndex);
+      forEachOverlayNote(addToIndex);
+      coverageIndexVersion = noteDataVersion;
+    }
+    const bucket = coverageIndex.get(time);
+    if (!bucket) return null;
     let found = null;
-    forEachInstrumentEvent((event) => {
-      const duration = Math.max(1, Number(event.duration) || 1);
-      if ((!activeOnly || isActiveEvent(event)) && event.note === note && time >= event.time && time < event.time + duration) found = event;
-    });
-    forEachOverlayNote((event) => {
-      const duration = Math.max(1, Number(event.duration) || 1);
-      if ((!activeOnly || isActiveEvent(event)) && event.note === note && time >= event.time && time < event.time + duration) found = event;
-    });
+    for (let i = 0; i < bucket.length; i++) {
+      const event = bucket[i];
+      if (event.note !== note) continue;
+      if (activeOnly && !isActiveEvent(event)) continue;
+      found = event; // last match wins, same as the original two-forEach version
+    }
     return found;
   }
 
@@ -518,6 +563,7 @@
   }
 
   function refreshInstrumentGrid() {
+    noteDataVersion++; // invalidates eventCovering's coverage index and the long-note-editor draw cache
     ensureEventTracks();
     patchEnhancedDrumCanvas();
     const grid = sm.grid.instrument;
@@ -2101,12 +2147,8 @@
     }
 
     function rowForPitch(pitch) {
-      for (let row = 0; row < grid.notes.rows; row++) {
-        try {
-          if (grid.indexToPitch(row) === pitch) return row;
-        } catch (_) {}
-      }
-      return null;
+      const map = pitchRowMapFor(grid);
+      return map.has(pitch) ? map.get(pitch) : null;
     }
 
     function pitchForRow(row) {
@@ -2182,29 +2224,47 @@
       return { x, y, width, height, right: x + width, bottom: y + height, row };
     }
 
+    // drawLongNotes (below) is registered as a draw method, so it's invoked by
+    // the native renderer on effectively every canvas repaint - scrolling,
+    // dragging, playback, any interaction. activeEvents()/ghostEvents() used to
+    // rebuild + sort the full note list from scratch on every single call (and
+    // drawLongNotes called activeEvents() twice per frame on top of that). On a
+    // large song that alone was enough to tank frame rate well before note
+    // count got anywhere near what triggers the import-time issue. This cache
+    // is rebuilt only when the underlying note data changes (noteDataVersion,
+    // bumped in refreshInstrumentGrid) or the active track changes.
+    let eventListCache = null; // { version, activeTrackId, active, ghost }
+
+    function getEventLists() {
+      if (
+        eventListCache &&
+        eventListCache.version === noteDataVersion &&
+        eventListCache.activeTrackId === state.activeTrackId
+      ) {
+        return eventListCache;
+      }
+      const active = [];
+      const ghost = [];
+      if (state.activeTrackId !== "__drums") {
+        forEachInstrumentEvent((event) => (isActiveEvent(event) ? active.push(event) : ghost.push(event)));
+        forEachOverlayNote((event) => (isActiveEvent(event) ? active.push(event) : ghost.push(event)));
+        const byDurationThenTime = (a, b) => eventDuration(b) - eventDuration(a) || a.time - b.time;
+        active.sort(byDurationThenTime);
+        ghost.sort(byDurationThenTime);
+      }
+      eventListCache = { version: noteDataVersion, activeTrackId: state.activeTrackId, active, ghost };
+      return eventListCache;
+    }
+
     function activeEvents() {
-      const events = [];
-      if (state.activeTrackId === "__drums") return events;
-      forEachInstrumentEvent((event) => {
-        if (isActiveEvent(event)) events.push(event);
-      });
-      forEachOverlayNote((event) => {
-        if (isActiveEvent(event)) events.push(event);
-      });
-      return events.sort((a, b) => eventDuration(b) - eventDuration(a) || a.time - b.time);
+      if (state.activeTrackId === "__drums") return [];
+      return getEventLists().active;
     }
 
     function ghostEvents() {
-      const events = [];
-      if (!state.allTrackMode || state.activeTrackId === "__drums") return events;
-      if (state.lowGraphics && !state.allTracksInLow) return events;
-      forEachInstrumentEvent((event) => {
-        if (!isActiveEvent(event)) events.push(event);
-      });
-      forEachOverlayNote((event) => {
-        if (!isActiveEvent(event)) events.push(event);
-      });
-      return events.sort((a, b) => eventDuration(b) - eventDuration(a) || a.time - b.time);
+      if (!state.allTrackMode || state.activeTrackId === "__drums") return [];
+      if (state.lowGraphics && !state.allTracksInLow) return [];
+      return getEventLists().ghost;
     }
 
     function hitTest(event) {
@@ -2409,8 +2469,9 @@
         });
       }
       const color = (currentTrack() && currentTrack().color) || "#16a8f0";
+      const active = activeEvents(); // computed once (cached) and reused below - this used to be two separate calls
       if (!state.lowGraphics) {
-        activeEvents().forEach((event) => {
+        active.forEach((event) => {
           if (eventDuration(event) <= 1) return;
           const rect = eventRect(event);
           if (rect) {
@@ -2418,7 +2479,7 @@
           }
         });
       }
-      activeEvents().forEach((event) => {
+      active.forEach((event) => {
         const rect = eventRect(event);
         if (rect) drawNoteText(rendererInstance.context, event, rect, isMutedEvent(event));
       });
