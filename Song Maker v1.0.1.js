@@ -115,6 +115,39 @@
     sm.midi.percussion.forEach((event) => fn(event));
   }
 
+  // --- Chunked import helpers -------------------------------------------------
+  // Large imports (tens of thousands of notes) used to add every note in one
+  // long synchronous loop. Combined with sm.changed() potentially firing on every
+  // single add() (see patchSaveAndHistory below, which used to do a full
+  // JSON.stringify + localStorage.setItem of the entire song on every change,
+  // unconditionally), that turned an O(n) import into an O(n^2) storm that hung
+  // and eventually crashed the tab. addEventsChunked keeps the import on a single
+  // thread but yields to the browser periodically so it never blocks long enough
+  // to trip the "page unresponsive" watchdog, and reports progress as it goes.
+  function nextFrame() {
+    return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  }
+
+  const IMPORT_CHUNK_SIZE = 1500; // notes processed per animation frame during a large import
+  const IMPORT_CHUNK_THRESHOLD = 3000; // small snapshots (undo/redo, normal-sized songs) apply in one go, no yielding needed
+
+  async function addEventsChunked(events, addOne, progressLabel) {
+    const total = events.length;
+    if (total === 0) return;
+    if (total <= IMPORT_CHUNK_THRESHOLD) {
+      for (let i = 0; i < total; i++) addOne(events[i]);
+      return;
+    }
+    const status = document.getElementById("cml-mod-status");
+    for (let i = 0; i < total; i++) {
+      addOne(events[i]);
+      if ((i + 1) % IMPORT_CHUNK_SIZE === 0) {
+        if (status) status.textContent = `${progressLabel}: ${(i + 1).toLocaleString()}/${total.toLocaleString()}...`;
+        await nextFrame();
+      }
+    }
+  }
+
   function serializeSong() {
     const instrument = [];
     const percussion = [];
@@ -166,8 +199,9 @@
     });
   }
 
-  function applySongSnapshot(snapshot, pushUndo = false) {
+  async function applySongSnapshot(snapshot, pushUndo = false) {
     if (!snapshot || !snapshot.options || !snapshot.midi) throw new Error("That JSON does not look like a Song Maker mod save.");
+    if (state.restoring) throw new Error("Still applying a previous change - try again in a moment.");
     state.restoring = true;
     try {
       sm.options.fromJSON(normalizePitchOptions(snapshot.options));
@@ -195,13 +229,16 @@
 
       sm.midi.instrument.clear();
       sm.midi.percussion.clear();
-      (snapshot.midi.instrument || []).forEach((note) => {
+      // Chunked + yielded: see addEventsChunked above. This, plus the
+      // state.restoring guard in patchSaveAndHistory's sm.changed override, is what
+      // keeps a 100k+ note import from freezing/crashing the tab.
+      await addEventsChunked(snapshot.midi.instrument || [], (note) => {
         const event = sm.midi.instrument.add(note.time, note.note, Math.max(1, Number(note.duration) || 1), false);
         if (event) event.__cmlTrack = note.track || "track-1";
-      });
-      (snapshot.midi.percussion || []).forEach((note) => {
+      }, "Importing notes");
+      await addEventsChunked(snapshot.midi.percussion || [], (note) => {
         sm.midi.percussion.add(note.time, note.note, Math.max(1, Number(note.duration) || 1), false);
-      });
+      }, "Importing percussion");
 
       if (sm.grid.resetInstruments) sm.grid.resetInstruments();
       if (sm.grid.resize) sm.grid.resize();
@@ -227,6 +264,9 @@
     if (pushUndo) pushUndoSnapshot();
   }
 
+  const MAX_UNDO_ENTRIES = 60;
+  const MAX_UNDO_BYTES = 40 * 1024 * 1024; // ~40MB across the whole stack - keeps big-song undo history from ballooning memory
+
   function pushUndoSnapshot() {
     if (state.restoring) return;
     const snapshot = serializeSong();
@@ -234,24 +274,31 @@
     const last = state.undoStack[state.undoStack.length - 1];
     if (last && last.key === key) return;
     state.undoStack.push({ key, snapshot });
-    if (state.undoStack.length > 60) state.undoStack.shift();
+    let totalBytes = 0;
+    for (let i = state.undoStack.length - 1; i >= 0; i--) totalBytes += state.undoStack[i].key.length;
+    while (state.undoStack.length > MAX_UNDO_ENTRIES || (totalBytes > MAX_UNDO_BYTES && state.undoStack.length > 1)) {
+      totalBytes -= state.undoStack[0].key.length;
+      state.undoStack.shift();
+    }
     state.redoStack = [];
   }
 
-  function undoModChange() {
+  async function undoModChange() {
+    if (state.restoring) return "Still busy - try again in a moment.";
     if (state.undoStack.length < 2) return "Nothing to undo.";
     const current = state.undoStack.pop();
     state.redoStack.push(current);
     const previous = state.undoStack[state.undoStack.length - 1];
-    applySongSnapshot(previous.snapshot, false);
+    await applySongSnapshot(previous.snapshot, false);
     return "Undo.";
   }
 
-  function redoModChange() {
+  async function redoModChange() {
+    if (state.restoring) return "Still busy - try again in a moment.";
     const next = state.redoStack.pop();
     if (!next) return "Nothing to redo.";
     state.undoStack.push(next);
-    applySongSnapshot(next.snapshot, false);
+    await applySongSnapshot(next.snapshot, false);
     return "Redo.";
   }
 
@@ -278,15 +325,17 @@
     const reader = new FileReader();
     reader.onload = () => {
       const status = document.getElementById("cml-mod-status");
-      try {
-        const snapshot = JSON.parse(String(reader.result || ""));
-        applySongSnapshot(snapshot, true);
-        sm.changed();
-        if (status) status.textContent = "Imported JSON backup.";
-      } catch (err) {
-        if (status) status.textContent = err.message || String(err);
-        console.error(err);
-      }
+      (async () => {
+        try {
+          const snapshot = JSON.parse(String(reader.result || ""));
+          await applySongSnapshot(snapshot, true);
+          sm.changed();
+          if (status) status.textContent = "Imported JSON backup.";
+        } catch (err) {
+          if (status) status.textContent = err.message || String(err);
+          console.error(err);
+        }
+      })();
     };
     reader.readAsText(file);
   }
@@ -1772,14 +1821,43 @@
   function patchSaveAndHistory() {
     if (!sm.__cmlSaveAndHistoryPatched) {
       const originalChanged = sm.changed.bind(sm);
-      sm.changed = function (...args) {
-        const result = originalChanged(...args);
+      let autosaveTimer = null;
+      const flushAutosave = () => {
+        autosaveTimer = null;
         try {
-          pushUndoSnapshot();
           localStorage.setItem("cml-song-maker-mod-autosave", JSON.stringify(serializeSong()));
         } catch (err) {
           console.warn("Could not autosave Song Maker mod snapshot", err);
         }
+      };
+      const scheduleAutosave = () => {
+        // Coalesce bursts of sm.changed() calls into a single write instead of
+        // re-serializing + re-writing the whole song to localStorage on every
+        // single note. Repeated full-song stringify+write on every change -
+        // unconditionally, even while an import loop was still running - was the
+        // actual root cause of the O(n^2) hang/crash on large imports.
+        if (autosaveTimer) return;
+        autosaveTimer = setTimeout(flushAutosave, 800);
+      };
+      window.addEventListener("beforeunload", () => {
+        if (autosaveTimer) {
+          clearTimeout(autosaveTimer);
+          flushAutosave();
+        }
+      });
+
+      sm.changed = function (...args) {
+        const result = originalChanged(...args);
+        // While applySongSnapshot is bulk-loading (import/undo/redo), skip the
+        // per-change undo-push and autosave entirely - see addEventsChunked and
+        // applySongSnapshot above for the rest of the fix.
+        if (state.restoring) return result;
+        try {
+          pushUndoSnapshot();
+        } catch (err) {
+          console.warn("Could not push undo snapshot", err);
+        }
+        scheduleAutosave();
         return result;
       };
 
@@ -1788,14 +1866,16 @@
         if (!/undefined|save|link/i.test(message)) return;
         const backup = localStorage.getItem("cml-song-maker-mod-autosave");
         if (!backup) return;
-        try {
-          applySongSnapshot(JSON.parse(backup), false);
-          downloadText(`song-maker-recovery-${Date.now()}.json`, backup);
-          const status = document.getElementById("cml-mod-status");
-          if (status) status.textContent = "Built-in save crashed, so I restored the autosave and downloaded a JSON recovery.";
-        } catch (err) {
-          console.warn("Could not restore autosave after save crash", err);
-        }
+        (async () => {
+          try {
+            await applySongSnapshot(JSON.parse(backup), false);
+            downloadText(`song-maker-recovery-${Date.now()}.json`, backup);
+            const status = document.getElementById("cml-mod-status");
+            if (status) status.textContent = "Built-in save crashed, so I restored the autosave and downloaded a JSON recovery.";
+          } catch (err) {
+            console.warn("Could not restore autosave after save crash", err);
+          }
+        })();
       });
 
       document.addEventListener("click", (event) => {
@@ -3498,20 +3578,20 @@
     }
   };
   document.getElementById("cml-undo").onclick = () => {
-    try {
-      status.textContent = undoModChange();
-    } catch (err) {
-      status.textContent = err.message || String(err);
-      console.error(err);
-    }
+    undoModChange()
+      .then((text) => { status.textContent = text; })
+      .catch((err) => {
+        status.textContent = err.message || String(err);
+        console.error(err);
+      });
   };
   document.getElementById("cml-redo").onclick = () => {
-    try {
-      status.textContent = redoModChange();
-    } catch (err) {
-      status.textContent = err.message || String(err);
-      console.error(err);
-    }
+    redoModChange()
+      .then((text) => { status.textContent = text; })
+      .catch((err) => {
+        status.textContent = err.message || String(err);
+        console.error(err);
+      });
   };
   document.getElementById("cml-export-json").onclick = () => {
     try {
