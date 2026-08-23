@@ -13,6 +13,30 @@
       tick();
     });
 
+  // updateDrag() (long-note drag/resize) fires on every native "mousemove"
+  // while dragging - which can be dozens to hundreds of times per second,
+  // well above the screen's actual repaint rate - and used to dispatch a
+  // full window "resize" event on every single one of those calls. Only one
+  // repaint happens per animation frame no matter how many times we dispatch
+  // in between, so anything beyond one dispatch per frame is pure waste -
+  // and at high note counts, whatever resize listeners do (ours and Song
+  // Maker's own native layout/redraw handling) gets a lot more expensive per
+  // call, making that waste much more noticeable. This collapses any number
+  // of calls within one animation frame into a single dispatch, with the
+  // exact same effect (something still repaints every frame) at a fraction
+  // of the cost. Only used for the drag path below; every other resize
+  // dispatch in this file fires once per discrete action already and is left
+  // as-is.
+  let resizeDispatchPending = false;
+  function scheduleResizeDispatch() {
+    if (resizeDispatchPending) return;
+    resizeDispatchPending = true;
+    requestAnimationFrame(() => {
+      resizeDispatchPending = false;
+      window.dispatchEvent(new Event("resize"));
+    });
+  }
+
   async function exposeInternals() {
     const res = await fetch("build/Main.js", { cache: "no-store" });
     if (!res.ok) throw new Error(`Could not fetch Song Maker bundle: ${res.status}`);
@@ -128,7 +152,7 @@
     return new Promise((resolve) => requestAnimationFrame(() => resolve()));
   }
 
-  const IMPORT_CHUNK_SIZE = 50; // notes processed per animation frame during a large import
+  const IMPORT_CHUNK_SIZE = 100; // notes processed per animation frame during a large import
   const IMPORT_CHUNK_THRESHOLD = 3000; // small snapshots (undo/redo, normal-sized songs) apply in one go, no yielding needed
 
   async function addEventsChunked(events, addOne, progressLabel) {
@@ -146,6 +170,36 @@
         await nextFrame();
       }
     }
+  }
+
+  // The native engine can log its own console.warn("Pitch out of scale", ...)
+  // for a note whose row falls outside whatever window the grid is
+  // currently rendering. On a dense multi-thousand-note import this can
+  // fire thousands of times, which is slow to print and reads like mass
+  // note loss - but a console.warn call on its own says nothing about
+  // whether sm.midi.instrument.add()/percussion.add() actually returned a
+  // rejected (falsy) result; that's tracked separately, above, via
+  // addWithForcedFit's own return-value check. This just keeps that native
+  // warning from flooding the console during import; it intercepts and
+  // counts matching messages instead of printing each one, restores
+  // console.warn no matter how fn() exits, and never touches unrelated
+  // warnings.
+  async function withNativeWarningSuppressed(pattern, fn) {
+    const originalWarn = console.warn;
+    let count = 0;
+    console.warn = (...args) => {
+      if (typeof args[0] === "string" && pattern.test(args[0])) {
+        count++;
+        return;
+      }
+      originalWarn.apply(console, args);
+    };
+    try {
+      await fn();
+    } finally {
+      console.warn = originalWarn;
+    }
+    return count;
   }
 
   function serializeSong() {
@@ -203,8 +257,19 @@
     if (!snapshot || !snapshot.options || !snapshot.midi) throw new Error("That JSON does not look like a Song Maker mod save.");
     if (state.restoring) throw new Error("Still applying a previous change - try again in a moment.");
     state.restoring = true;
+    let rejectedCount = 0;
+    let expansions = 0;
     try {
-      sm.options.fromJSON(normalizePitchOptions(snapshot.options));
+      const fittedOptions = fitOptionsToSnapshotNotes(normalizePitchOptions(snapshot.options), snapshot);
+      sm.options.fromJSON(fittedOptions);
+      // fromJSON, and/or resetInstruments/resize below, may themselves clamp
+      // bars/octaves/rootNote/tempo to whatever range the native UI was
+      // built with (confirmed for tempo: an imported 270 silently became
+      // 240). forceGridOptions re-overwrites the actual option values AND
+      // rebuilds the grid + syncs the visible number inputs from those
+      // corrected values, in that order, so the grid is never sized from a
+      // stale/clamped number.
+      forceGridOptions(fittedOptions);
       state.tracks = (snapshot.tracks && snapshot.tracks.length ? snapshot.tracks : [emptyTrack()]).map((track, index) => ({
         id: track.id || `track-${index + 1}`,
         name: track.name || `Track ${index + 1}`,
@@ -232,24 +297,105 @@
       // Chunked + yielded: see addEventsChunked above. This, plus the
       // state.restoring guard in patchSaveAndHistory's sm.changed override, is what
       // keeps a 100k+ note import from freezing/crashing the tab.
-      await addEventsChunked(snapshot.midi.instrument || [], (note) => {
-        const event = sm.midi.instrument.add(note.time, note.note, Math.max(1, Number(note.duration) || 1), false);
-        if (event) event.__cmlTrack = note.track || "track-1";
-      }, "Importing notes");
-      await addEventsChunked(snapshot.midi.percussion || [], (note) => {
-        sm.midi.percussion.add(note.time, note.note, Math.max(1, Number(note.duration) || 1), false);
-      }, "Importing percussion");
+      //
+      // Notes must never be dropped. fitOptionsToSnapshotNotes already sizes
+      // the grid to fit everything up front, so add() rejecting a note here
+      // should be rare - but if it ever does happen (a value the pre-scan
+      // didn't account for, a mid-import clamp, etc.), growGridToFit expands
+      // bounds to cover that exact note and it's retried immediately, in
+      // place, before moving on. This can only stop on a note whose values
+      // are fundamentally invalid (NaN/non-finite), not on anything bounds
+      // could fix.
+      let currentOptions = { ...fittedOptions };
+      const addWithForcedFit = (addFn, note, kind) => {
+        let event = addFn();
+        if (event) return event;
+        const grown = growGridToFit(currentOptions, note);
+        if (!grown) {
+          rejectedCount++;
+          console.error(`[cml-import] could not place ${kind} note (invalid data, bounds can't fix this):`, note);
+          return null;
+        }
+        currentOptions = grown;
+        expansions++;
+        forceGridOptions(currentOptions);
+        event = addFn();
+        if (!event) {
+          // Still rejected even after growing bounds around it exactly -
+          // something else is wrong with this note. Report it rather than
+          // silently losing it. Log the *live* sm.options/grid state (not
+          // just our tracked currentOptions) plus the row this note would
+          // need, so we can see directly whether this is the known
+          // row-count-cap issue (grid.instrument.notes.rows ending up
+          // smaller than octaves*12 actually calls for) rather than
+          // guessing from currentOptions, which only reflects what we
+          // *asked* for, not what the native grid actually built.
+          rejectedCount++;
+          const liveRows = sm.grid.instrument && sm.grid.instrument.notes ? sm.grid.instrument.notes.rows : "unknown";
+          const neededRow = Number(note.note) - sm.options.rootNote;
+          console.error(
+            `[cml-import] ${kind} note still rejected after expanding grid to fit it:`, note,
+            `\n  asked for:`, currentOptions,
+            `\n  live sm.options: rootNote=${sm.options.rootNote} octaves=${sm.options.octaves} scale=${sm.options.scale}`,
+            `\n  live grid rows: ${liveRows} (this note needs row ${neededRow}${liveRows !== "unknown" ? `, cap is ${liveRows}` : ""})`
+          );
+        }
+        return event;
+      };
 
-      if (sm.grid.resetInstruments) sm.grid.resetInstruments();
-      if (sm.grid.resize) sm.grid.resize();
-      const barsInput = document.getElementById("cml-bars");
-      const upperInput = document.getElementById("cml-upper-octaves");
-      const lowerInput = document.getElementById("cml-lower-octaves");
-      const subdivisionInput = document.getElementById("cml-subdivision");
-      if (barsInput) barsInput.value = sm.options.bars;
-      if (upperInput) upperInput.value = sm.options.octaves;
-      if (lowerInput) lowerInput.value = 0;
-      if (subdivisionInput) subdivisionInput.value = sm.options.subdivision;
+      const nativeScaleWarningPattern = /pitch out of scale/i;
+      let suppressedNativeWarnings = 0;
+      suppressedNativeWarnings += await withNativeWarningSuppressed(nativeScaleWarningPattern, () =>
+        addEventsChunked(snapshot.midi.instrument || [], (note) => {
+          const duration = Math.max(1, Number(note.duration) || 1);
+          const event = addWithForcedFit(() => sm.midi.instrument.add(note.time, note.note, duration, false), note, "instrument");
+          if (event) event.__cmlTrack = note.track || "track-1";
+        }, "Importing notes")
+      );
+      suppressedNativeWarnings += await withNativeWarningSuppressed(nativeScaleWarningPattern, () =>
+        addEventsChunked(snapshot.midi.percussion || [], (note) => {
+          const duration = Math.max(1, Number(note.duration) || 1);
+          addWithForcedFit(() => sm.midi.percussion.add(note.time, note.note, duration, false), note, "percussion");
+        }, "Importing percussion")
+      );
+      if (expansions) {
+        console.warn(`[cml-import] grid had to expand ${expansions} time(s) mid-import to fit notes the pre-scan missed. Final options:`, currentOptions);
+      }
+      if (rejectedCount) {
+        console.error(`[cml-import] ${rejectedCount} note(s) could not be placed even after expanding the grid - their data must be invalid (non-finite time/note). See errors above for details.`);
+      }
+
+      // Ground truth check: don't trust the presence/absence of the native
+      // warning either way - actually count what ended up in sm.midi and
+      // compare it to how many notes in the source JSON had valid
+      // (finite) time/note data. This is the real answer to "were any
+      // notes dropped", independent of what any console message implied.
+      const isValidNote = (n) => Number.isFinite(Number(n && n.time)) && Number.isFinite(Number(n && n.note));
+      const expectedInstrumentCount = (snapshot.midi.instrument || []).filter(isValidNote).length;
+      const expectedPercussionCount = (snapshot.midi.percussion || []).filter(isValidNote).length;
+      let actualInstrumentCount = 0;
+      forEachInstrumentEvent(() => actualInstrumentCount++);
+      let actualPercussionCount = 0;
+      forEachPercussionEvent(() => actualPercussionCount++);
+      if (suppressedNativeWarnings) {
+        console.warn(
+          `[cml-import] suppressed ${suppressedNativeWarnings} native "Pitch out of scale" warning(s) during import to keep the console usable. ` +
+          `That message alone does not mean a note was dropped - see the verification line below for the actual count.`
+        );
+      }
+      const instrumentOk = actualInstrumentCount >= expectedInstrumentCount;
+      const percussionOk = actualPercussionCount >= expectedPercussionCount;
+      const verifyLine = `[cml-import] verified note count: instrument ${actualInstrumentCount}/${expectedInstrumentCount}, percussion ${actualPercussionCount}/${expectedPercussionCount}.`;
+      if (instrumentOk && percussionOk) {
+        console.log(verifyLine + " All valid notes from the file are present in sm.midi.");
+      } else {
+        console.error(
+          verifyLine + " MISMATCH - fewer notes ended up in sm.midi than the file had, despite no rejection being " +
+          "logged above. This points to something rejecting notes without going through sm.midi.instrument.add()'s " +
+          "normal return value (or two notes colliding on the exact same time+pitch and merging into one event)."
+        );
+      }
+
       sm.player.syncWithMidiTrack();
       if (sm.player.percussionTrack) sm.player.percussionTrack.syncWithMidiTrack();
       rebuildEnhancedDrumPart();
@@ -257,11 +403,17 @@
       refreshInstrumentGrid();
       refreshPercussionGrid();
       renderTracks();
+      // Final pass: re-force everything once more after resize/resync/track
+      // rendering, in case anything in that sequence reads a clamped DOM
+      // value back into options (this is what was previously capping
+      // imported tempo at 240 and octaves at whatever the native default is).
+      forceGridOptions(currentOptions);
       window.dispatchEvent(new Event("resize"));
     } finally {
       state.restoring = false;
     }
     if (pushUndo) pushUndoSnapshot();
+    return { rejectedCount };
   }
 
   const MAX_UNDO_ENTRIES = 60;
@@ -328,9 +480,13 @@
       (async () => {
         try {
           const snapshot = JSON.parse(String(reader.result || ""));
-          await applySongSnapshot(snapshot, true);
+          const { rejectedCount } = await applySongSnapshot(snapshot, true);
           sm.changed();
-          if (status) status.textContent = "Imported JSON backup.";
+          if (status) {
+            status.textContent = rejectedCount
+              ? `Imported JSON backup - ${rejectedCount} note(s) rejected, see console.`
+              : "Imported JSON backup.";
+          }
         } catch (err) {
           if (status) status.textContent = err.message || String(err);
           console.error(err);
@@ -616,6 +772,214 @@
       end = Math.max(end, event.time + Math.max(1, Number(event.duration) || 1));
     });
     return end;
+  }
+
+  // Same idea as fitOptionsToExistingNotes, but works directly off the raw
+  // JSON of an import *before* anything has been loaded into sm.midi yet.
+  // applySongSnapshot used to call sm.options.fromJSON() with only the
+  // snapshot's own stated bars/octaves/rootNote, trusting that header to
+  // already be correct. When it understates the real note range (a stale
+  // header, a hand-edited file, or just an off-by-one in whatever produced
+  // it), sm.midi.instrument.add()/percussion.add() below silently reject
+  // any note outside that grid instead of throwing - so notes disappear
+  // with no error. This recomputes the grid straight from the note data
+  // that's about to be imported, so the grid is never smaller than the
+  // song actually needs, regardless of what the header claims.
+  function fitOptionsToSnapshotNotes(options, snapshot) {
+    let minNote = Infinity;
+    let maxNote = -Infinity;
+    let end = 0;
+    const scan = (list) => {
+      if (!Array.isArray(list)) return;
+      for (const event of list) {
+        const note = Number(event.note);
+        const time = Number(event.time) || 0;
+        const duration = Math.max(1, Number(event.duration) || 1);
+        if (Number.isFinite(note)) {
+          if (note < minNote) minNote = note;
+          if (note > maxNote) maxNote = note;
+        }
+        const eventEnd = time + duration;
+        if (eventEnd > end) end = eventEnd;
+      }
+    };
+    scan(snapshot.midi && snapshot.midi.instrument);
+    scan(snapshot.midi && snapshot.midi.percussion);
+    scan(snapshot.overlayNotes);
+
+    const beats = Math.max(1, Number(options.beats) || 4);
+    const subdivision = Math.max(1, Number(options.subdivision) || 2);
+    const minBars = Math.max(1, Math.ceil(end / (beats * subdivision)));
+
+    let rootNote = Math.max(0, Math.round(Number(options.rootNote) || 0));
+    let octaves = Math.max(1, Math.round(Number(options.octaves) || 1));
+    if (Number.isFinite(minNote) && Number.isFinite(maxNote)) {
+      if (rootNote > minNote) rootNote = Math.max(0, Math.floor(minNote / 12) * 12);
+      const requestedTop = rootNote + 12 * octaves;
+      const neededTop = Math.max(requestedTop, maxNote + 1);
+      octaves = Math.max(1, Math.ceil((neededTop - rootNote) / 12));
+    }
+
+    const fittedBars = Math.max(Math.round(Number(options.bars) || 1), minBars);
+    if (fittedBars !== options.bars || octaves !== options.octaves || rootNote !== options.rootNote) {
+      console.warn(
+        `[cml-import] expanded grid to fit notes: bars ${options.bars}->${fittedBars}, ` +
+        `octaves ${options.octaves}->${octaves}, rootNote ${options.rootNote}->${rootNote}`
+      );
+    }
+    // Bars/octaves/rootNote only fix *range* rejections. A note can still be
+    // rejected for landing on a semitone the declared scale (e.g. "major")
+    // doesn't expose as a row, no matter how big the range is. Imported
+    // note pitches are raw absolute semitone values, not scale-degree
+    // indices, so the only scale guaranteed to have a row for every one of
+    // them is chromatic (all 12 semitones/octave) - see IMPORT_SCALE.
+    if (options.scale && options.scale !== "chromatic") {
+      console.warn(`[cml-import] forcing scale "${options.scale}" -> "chromatic" so every imported pitch has a valid row.`);
+    }
+    return { ...options, bars: fittedBars, rootNote, octaves, scale: "chromatic" };
+  }
+
+  // The native option-setting/UI (fromJSON, the tempo slider, the grid
+  // resize routine) clamps bars/octaves/rootNote/tempo to whatever ranges
+  // they were built with by default - confirmed for tempo (270 silently
+  // became 240), and consistent with what only ever showing ~6 of a
+  // declared 10 octaves looks like: the grid gets rebuilt from a clamped
+  // number rather than the value we actually asked for. This re-applies
+  // the real values directly to sm.options, resyncs the visible number
+  // inputs to match *before* rebuilding the grid (so the rebuild can't read
+  // a stale/clamped input back), then rebuilds the grid from those corrected
+  // values - so nothing downstream ever sees the clamped numbers.
+  // Song Maker's grid rows aren't just windowed by octaves/rootNote - they're
+  // also filtered by *scale* (major/minor/pentatonic/etc only expose 5-7 of
+  // the 12 semitones per octave as valid rows). The imported JSON's own
+  // options carry a "scale" field (confirmed: this file's header says
+  // "scale": "major"), and add()'s native "Pitch out of scale" check is
+  // almost certainly validating each note's pitch against that - not just
+  // against rootNote/octaves. A dense chromatic passage that touches all 12
+  // semitones per octave will always fail a non-chromatic scale, no matter
+  // how large bars/octaves/rootNote get forced. Since imported notes carry
+  // raw absolute pitch numbers (not scale-degree indices), forcing the grid
+  // to "chromatic" - which by definition exposes all 12 semitones as valid
+  // rows - is the only scale setting that can guarantee every note in the
+  // file has a row to land in. This never changes what pitch a note sounds
+  // at; it only ever widens which rows exist, same spirit as the
+  // bars/octaves/rootNote forcing right below.
+  const IMPORT_SCALE = "chromatic";
+
+  function forceScaleControlsInDom(scale) {
+    // Best-effort: some Song Maker builds keep the scale choice in a
+    // select/radio control that resize()/resetInstruments() reads back into
+    // sm.options (this is exactly what happened with the tempo slider - see
+    // the tempo-slider sync below). We don't know this build's exact DOM id,
+    // so search broadly for a control whose id/name mentions "scale" or
+    // whose value matches a known scale name, and nudge it to chromatic.
+    const candidates = document.querySelectorAll(
+      'select[id*="scale" i], select[name*="scale" i], input[id*="scale" i], input[name*="scale" i], [data-scale]'
+    );
+    candidates.forEach((el) => {
+      if (el.tagName === "SELECT") {
+        const option = Array.from(el.options || []).find((o) => o.value === scale);
+        if (option && el.value !== scale) {
+          el.value = scale;
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      } else if (el.type === "radio") {
+        const shouldCheck = el.value === scale;
+        if (el.checked !== shouldCheck) {
+          el.checked = shouldCheck;
+          if (shouldCheck) {
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+        }
+      }
+    });
+  }
+
+  function forceGridOptions(options) {
+    if (Number.isFinite(Number(options.tempo)) && Number(options.tempo) > 0) {
+      sm.options.tempo = Number(options.tempo);
+    }
+    if (Number.isFinite(Number(options.bars))) sm.options.bars = Math.max(1, Math.round(Number(options.bars)));
+    if (Number.isFinite(Number(options.octaves))) sm.options.octaves = Math.max(1, Math.round(Number(options.octaves)));
+    if (Number.isFinite(Number(options.rootNote))) {
+      sm.options.rootNote = Math.max(0, Math.round(Number(options.rootNote)));
+      sm.options.rootPitch = sm.options.rootNote % 12;
+      sm.options.rootOctave = Math.floor(sm.options.rootNote / 12);
+    }
+    if (Number.isFinite(Number(options.subdivision))) sm.options.subdivision = Math.max(1, Math.round(Number(options.subdivision)));
+    sm.options.scale = IMPORT_SCALE;
+    forceScaleControlsInDom(IMPORT_SCALE);
+
+    const barsInput = document.getElementById("cml-bars");
+    const upperInput = document.getElementById("cml-upper-octaves");
+    const lowerInput = document.getElementById("cml-lower-octaves");
+    const subdivisionInput = document.getElementById("cml-subdivision");
+    if (barsInput) barsInput.value = sm.options.bars;
+    if (upperInput) upperInput.value = sm.options.octaves;
+    if (lowerInput) lowerInput.value = 0;
+    if (subdivisionInput) subdivisionInput.value = sm.options.subdivision;
+
+    if (sm.grid.resetInstruments) sm.grid.resetInstruments();
+    if (sm.grid.resize) sm.grid.resize();
+
+    const tempoSlider = document.getElementById("tempo-slider");
+    if (tempoSlider) {
+      for (const input of tempoSlider.querySelectorAll("input")) {
+        if (input.value === String(sm.options.tempo)) continue;
+        input.value = sm.options.tempo;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    }
+    // Grid rebuild or the slider dispatch above may have re-clamped things
+    // again - stamp the real values back on one more time, after everything
+    // downstream has had its say.
+    if (Number.isFinite(Number(options.tempo))) sm.options.tempo = Number(options.tempo);
+    if (Number.isFinite(Number(options.bars))) sm.options.bars = Math.max(1, Math.round(Number(options.bars)));
+    if (Number.isFinite(Number(options.octaves))) sm.options.octaves = Math.max(1, Math.round(Number(options.octaves)));
+    sm.options.scale = IMPORT_SCALE;
+
+    if (sm.grid.instrument && sm.grid.instrument.notes) {
+      const expectedRows = sm.options.octaves * 12;
+      if (sm.grid.instrument.notes.rows < expectedRows) {
+        console.warn(
+          `[cml-import] grid still only has ${sm.grid.instrument.notes.rows} rows after forcing octaves to ${sm.options.octaves} ` +
+          `(expected ${expectedRows}). The native grid/canvas may itself be capping row count independent of sm.options - ` +
+          `notes outside that range will play (they're still in the data) but won't render.`
+        );
+      }
+    }
+  }
+
+  // Grows bars/octaves/rootNote (never shrinks them) so a single specific
+  // note is guaranteed to fit, then returns the new options. Used as a
+  // last-resort safety net when add() rejects a note despite the upfront
+  // fitOptionsToSnapshotNotes pass. Returns null only when the note's own
+  // values are non-finite - no amount of bounds-growing can place a note
+  // that isn't a real number.
+  function growGridToFit(options, note) {
+    const time = Number(note.time);
+    const pitch = Number(note.note);
+    const duration = Math.max(1, Number(note.duration) || 1);
+    if (!Number.isFinite(time) || !Number.isFinite(pitch)) return null;
+
+    const beats = Math.max(1, Number(options.beats) || 4);
+    const subdivision = Math.max(1, Number(options.subdivision) || 2);
+    const neededBars = Math.max(Math.round(Number(options.bars) || 1), Math.ceil((time + duration) / (beats * subdivision)));
+
+    let rootNote = Math.max(0, Math.round(Number(options.rootNote) || 0));
+    let octaves = Math.max(1, Math.round(Number(options.octaves) || 1));
+    if (pitch < rootNote) rootNote = Math.max(0, Math.floor(pitch / 12) * 12);
+    const top = rootNote + 12 * octaves;
+    if (pitch >= top) octaves = Math.max(octaves, Math.ceil((pitch - rootNote + 1) / 12));
+
+    // Same reasoning as fitOptionsToSnapshotNotes: a rejection this function
+    // is trying to fix could be a scale rejection, not a range one - growing
+    // rootNote/octaves alone won't fix that. Force chromatic here too so the
+    // retry in addWithForcedFit is guaranteed to have a row for this pitch.
+    return { ...options, bars: neededBars, rootNote, octaves, scale: "chromatic" };
   }
 
   function fitOptionsToExistingNotes(options) {
@@ -2233,7 +2597,58 @@
     // count got anywhere near what triggers the import-time issue. This cache
     // is rebuilt only when the underlying note data changes (noteDataVersion,
     // bumped in refreshInstrumentGrid) or the active track changes.
-    let eventListCache = null; // { version, activeTrackId, active, ghost }
+    let eventListCache = null; // { version, activeTrackId, active, ghost, activeByTime, ghostByTime }
+
+    // Time-sorted index + binary search, so a frame only has to touch notes
+    // actually near the visible scroll window instead of scanning the whole
+    // song. `active`/`ghost` above are sorted by duration (for draw z-order),
+    // which can't be binary-searched by time - so we keep a second,
+    // time-sorted copy alongside it. Built once per data change (same trigger
+    // as the cache above), never per frame.
+    function buildTimeIndex(list) {
+      const byTime = list.slice().sort((a, b) => a.time - b.time);
+      let maxDuration = 1;
+      for (let i = 0; i < byTime.length; i++) {
+        const d = eventDuration(byTime[i]);
+        if (d > maxDuration) maxDuration = d;
+      }
+      return { list: byTime, maxDuration };
+    }
+
+    // First index whose event.time is >= value.
+    function lowerBoundByTime(list, value) {
+      let lo = 0, hi = list.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (list[mid].time < value) lo = mid + 1;
+        else hi = mid;
+      }
+      return lo;
+    }
+
+    // First index whose event.time is > value.
+    function upperBoundByTime(list, value) {
+      let lo = 0, hi = list.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (list[mid].time <= value) lo = mid + 1;
+        else hi = mid;
+      }
+      return lo;
+    }
+
+    // Returns notes whose [time, time+duration] range could overlap
+    // [xMin, xMax]. Uses maxDuration to widen the lower bound so a long note
+    // starting just before xMin is never missed. This can over-include a
+    // little (e.g. if one note in the set has an unusually long duration) -
+    // callers still do an exact per-note bounds check before actually
+    // drawing, so correctness never depends on this being tight, only fast.
+    function candidatesInRange(indexed, xMin, xMax) {
+      if (!indexed || !indexed.list.length) return [];
+      const lo = lowerBoundByTime(indexed.list, xMin - indexed.maxDuration);
+      const hi = upperBoundByTime(indexed.list, xMax);
+      return lo < hi ? indexed.list.slice(Math.max(0, lo), hi) : [];
+    }
 
     function getEventLists() {
       if (
@@ -2252,8 +2667,32 @@
         active.sort(byDurationThenTime);
         ghost.sort(byDurationThenTime);
       }
-      eventListCache = { version: noteDataVersion, activeTrackId: state.activeTrackId, active, ghost };
+      eventListCache = {
+        version: noteDataVersion,
+        activeTrackId: state.activeTrackId,
+        active,
+        ghost,
+        activeByTime: buildTimeIndex(active),
+        ghostByTime: buildTimeIndex(ghost),
+      };
       return eventListCache;
+    }
+
+    // Visible-range subset of a list, re-sorted back to (duration desc, time
+    // asc) so draw order/z-order exactly matches the un-culled original -
+    // longer notes still get laid down before shorter ones overlapping them.
+    // Falls back to the full pre-sorted list when we don't have viewport
+    // bounds to cull against (e.g. renderer.bounds isn't populated yet).
+    function visibleForDrawing(indexed, fullSortedList, xMin, xMax) {
+      if (xMin === undefined || xMax === undefined) return fullSortedList;
+      const candidates = candidatesInRange(indexed, xMin, xMax);
+      const visible = [];
+      for (let i = 0; i < candidates.length; i++) {
+        const event = candidates[i];
+        if (event.time + eventDuration(event) >= xMin && event.time <= xMax) visible.push(event);
+      }
+      visible.sort((a, b) => eventDuration(b) - eventDuration(a) || a.time - b.time);
+      return visible;
     }
 
     function activeEvents() {
@@ -2458,9 +2897,22 @@
       };
       if (!state.lowGraphics) requestAnimationFrame(renderAudioGridLayer);
       if (state.activeTrackId === "__drums") return false;
+
+      // Bounds are in the same tile-column units as event.time/duration
+      // (same object/units the drum canvas draw method already relies on).
+      const bounds = rendererInstance.bounds;
+      const xMin = bounds ? bounds.xMin : undefined;
+      const xMax = bounds ? bounds.xMax : undefined;
+      const lists = getEventLists();
+
       const shouldDrawGhosts = !state.lowGraphics || (state.allTrackMode && state.allTracksInLow);
-      if (shouldDrawGhosts) {
-        ghostEvents().forEach((event) => {
+      // Same gating ghostEvents() applies - duplicated here (instead of
+      // calling ghostEvents()) so we can pull from the time-indexed cache.
+      const ghostsEnabled = shouldDrawGhosts && state.allTrackMode && state.activeTrackId !== "__drums"
+        && !(state.lowGraphics && !state.allTracksInLow);
+      if (ghostsEnabled) {
+        const visibleGhosts = visibleForDrawing(lists.ghostByTime, lists.ghost, xMin, xMax);
+        visibleGhosts.forEach((event) => {
           const rect = eventRect(event);
           if (!rect) return;
           const track = state.tracks.find((item) => item.id === (event.__cmlTrack || "track-1"));
@@ -2469,9 +2921,9 @@
         });
       }
       const color = (currentTrack() && currentTrack().color) || "#16a8f0";
-      const active = activeEvents(); // computed once (cached) and reused below - this used to be two separate calls
+      const visibleActive = visibleForDrawing(lists.activeByTime, lists.active, xMin, xMax);
       if (!state.lowGraphics) {
-        active.forEach((event) => {
+        visibleActive.forEach((event) => {
           if (eventDuration(event) <= 1) return;
           const rect = eventRect(event);
           if (rect) {
@@ -2479,7 +2931,7 @@
           }
         });
       }
-      active.forEach((event) => {
+      visibleActive.forEach((event) => {
         const rect = eventRect(event);
         if (rect) drawNoteText(rendererInstance.context, event, rect, isMutedEvent(event));
       });
@@ -2614,7 +3066,7 @@
         }
         state.__audioClipPreview = { clip, rect: audioClipRect({ ...clip, startTime: previewStart, lengthSeconds: previewLength * secondsPerSubBeat() }) };
       }
-      window.dispatchEvent(new Event("resize"));
+      scheduleResizeDispatch();
     }
 
     function endDrag(event) {
